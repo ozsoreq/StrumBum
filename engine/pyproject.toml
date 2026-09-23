@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "strumbum-engine"
+version = "0.1.0"
+description = "On-device pitch engine for the StrumBum guitar tuner (MPM with YIN fallback)"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.23"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "soundfile>=0.12", "scipy>=1.10"]
+reference = ["librosa>=0.10", "aubio>=0.4.9"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]

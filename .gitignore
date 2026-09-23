@@ -1,0 +1,21 @@
+# Gradle / Android
+.gradle/
+build/
+/local.properties
+/captures
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.keystore
+*.jks
+keystore.properties
+.idea/
+*.iml
+.DS_Store
+
+# Python
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.venv/
