@@ -5,6 +5,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# The build only reads the repo; keep the token read-only.
+permissions:
+  contents: read
+
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true

@@ -85,7 +85,8 @@ chaquopy {
         version = "3.13"
         providers.gradleProperty("strumbum.buildPython").orNull?.let { buildPython(it) }
         pip {
-            install("numpy")
+            // Pinned so a build never silently picks up a different binary from the package index.
+            install("numpy==1.26.2")
         }
         pyc {
             src = true
