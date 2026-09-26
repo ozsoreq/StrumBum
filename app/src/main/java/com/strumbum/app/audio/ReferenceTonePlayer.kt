@@ -39,6 +39,9 @@ class ReferenceTonePlayer(private val context: Context) {
         midis.forEach { load(it) }
     }
 
+    /** True if there is a rendered tone for [midi] (see [com.strumbum.app.music.Tunings.toneRange]). */
+    fun canPlay(midi: Int): Boolean = midi in TONES
+
     fun play(midi: Int, a4: Double) {
         val id = load(midi) ?: return
         val rate = (a4 / NoteMath.DEFAULT_A4).toFloat().coerceIn(0.5f, 2.0f)

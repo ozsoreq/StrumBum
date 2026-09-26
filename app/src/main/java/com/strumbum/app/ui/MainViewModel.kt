@@ -16,6 +16,8 @@ import com.strumbum.app.data.SettingsRepository
 import com.strumbum.app.data.ThemeMode
 import com.strumbum.app.music.InTuneDetector
 import com.strumbum.app.music.NoteMath
+import com.strumbum.app.music.NoteTracker
+import com.strumbum.app.music.StickyRounder
 import com.strumbum.app.music.StringPicker
 import com.strumbum.app.music.Tuning
 import com.strumbum.app.music.Tunings
@@ -32,6 +34,7 @@ import kotlinx.coroutines.flow.distinctUntilChangedBy
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlin.math.abs
 
 data class TunerUiState(
     val tuning: Tuning = Tunings.STANDARD,
@@ -42,16 +45,19 @@ data class TunerUiState(
     val targetString: Int? = null,
     /** Note the needle is measured against; null before the first reading. */
     val targetMidi: Int? = null,
-    /** Nearest chromatic note to what is actually being played. */
+    /** Nearest chromatic note to what is actually being played (with hysteresis at ±50 cents). */
     val detectedMidi: Int? = null,
     val hz: Double? = null,
     /** Offset from the target note in cents; negative is flat. */
     val cents: Double? = null,
-    /** True while the current frame has a confident pitch. */
-    val live: Boolean = false,
+    /** |cents| rounded for the "N cents flat" text, with hysteresis so it doesn't flicker. */
+    val roundedCents: Int? = null,
     /** True once the string has been silent long enough that the held reading should fade. */
     val stale: Boolean = true,
+    /** Locked in tune: held within ±3 cents for 400 ms. Drives the glow and the haptic tick. */
     val inTune: Boolean = false,
+    /** Within the in-tune band right now (enter ±3 cents, leave past ±5). Drives the label. */
+    val centered: Boolean = false,
     val tunedStrings: Set<Int> = emptySet(),
     val status: CaptureStatus = CaptureStatus.Idle,
 )
@@ -68,6 +74,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val tunedStrings = MutableStateFlow<Set<Int>>(emptySet())
     private val picker = StringPicker()
     private val inTune = InTuneDetector()
+    private val notes = NoteTracker()
+    private val rounder = StickyRounder()
     private var lastTarget: Int? = null
     private var unmuteJob: Job? = null
 
@@ -83,8 +91,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     init {
         viewModelScope.launch {
             settings.filterNotNull().distinctUntilChangedBy { it.tuningId }.collect { s ->
-                picker.reset()
-                inTune.reset()
+                resetTracking()
                 lockedString.value = null
                 tunedStrings.value = emptySet()
                 tones.prepare(Tunings.byId(s.tuningId).strings)
@@ -97,25 +104,34 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun reduce(r: PitchReading, s: AppSettings, lock: Int?, tuned: Set<Int>, status: CaptureStatus): TunerUiState {
+    private fun reduce(r: PitchReading, s: AppSettings, requestedLock: Int?, tuned: Set<Int>, status: CaptureStatus): TunerUiState {
         val tuning = Tunings.byId(s.tuningId)
         val a4 = s.a4Hz.toDouble()
+        // The lock is cleared by another collector after a tuning change, so an intermediate
+        // state can pair a new tuning with an old index. Never pass on an index it doesn't have.
+        val lock = requestedLock?.takeIf { it in tuning.strings.indices }
         val base = TunerUiState(tuning = tuning, a4 = a4, lockedString = lock, tunedStrings = tuned, status = status)
-        if (r.hz <= 0.0) {
+        if (!r.hz.isFinite() || r.hz <= 0.0) {
             inTune.update(null, SystemClock.elapsedRealtime())
-            val target = lock?.let { tuning.strings.getOrNull(it) }
+            notes.reset()
+            val target = lock?.let { tuning.strings[it] }
             return base.copy(targetString = lock, targetMidi = target, inTune = inTune.inTune)
         }
+        val stale = !r.hasPitch && r.silentFrames > STALE_FRAMES
+        // The next pluck names its note afresh.
+        if (stale) notes.reset()
         val stringIndex = when {
             tuning.isChromatic -> null
-            lock != null && lock in tuning.strings.indices -> lock
+            lock != null -> lock
             else -> picker.pick(r.hz, tuning.strings, a4)
         }
-        val targetMidi = stringIndex?.let { tuning.strings[it] } ?: NoteMath.nearestMidi(r.hz, a4)
+        val detectedMidi = notes.nearest(r.hz, a4)
+        val targetMidi = stringIndex?.let { tuning.strings[it] } ?: detectedMidi
         val cents = NoteMath.cents(r.hz, NoteMath.midiToHz(targetMidi, a4))
 
         if (targetMidi != lastTarget) {
             inTune.reset()
+            rounder.reset()
             lastTarget = targetMidi
         }
         val locked = inTune.update(if (r.hasPitch) cents else null, SystemClock.elapsedRealtime())
@@ -126,12 +142,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         return base.copy(
             targetString = stringIndex,
             targetMidi = targetMidi,
-            detectedMidi = NoteMath.nearestMidi(r.hz, a4),
+            detectedMidi = detectedMidi,
             hz = r.hz,
             cents = cents,
-            live = r.hasPitch,
-            stale = !r.hasPitch && r.silentFrames > STALE_FRAMES,
+            roundedCents = rounder.round(abs(cents)),
+            stale = stale,
             inTune = inTune.inTune,
+            centered = inTune.centered,
         )
     }
 
@@ -141,6 +158,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (ContextCompat.checkSelfPermission(getApplication(), Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
         ) {
+            resetTracking()
             capture.start()
         }
     }
@@ -148,6 +166,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun stopListening() {
         capture.stop()
         tones.stop()
+        resetTracking()
+    }
+
+    /** Forget the previous session: no in-tune glow without a pitch, and a fresh tick next time. */
+    private fun resetTracking() {
+        picker.reset()
+        inTune.reset()
+        notes.reset()
+        rounder.reset()
+        lastTarget = null
     }
 
     // -- tuner actions -------------------------------------------------------------
@@ -159,10 +187,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun unlock() {
         lockedString.value = null
+        inTune.reset()
     }
 
     /** Play [midi]'s reference tone. The mic is muted meanwhile so the tuner doesn't read the speaker. */
     fun playTone(midi: Int) {
+        // No tone for this note (chromatic mode can target any note): don't mute the mic for nothing.
+        if (!tones.canPlay(midi)) return
         val a4 = settings.value?.a4Hz?.toDouble() ?: NoteMath.DEFAULT_A4
         capture.muted = true
         tones.play(midi, a4)
@@ -189,7 +220,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private companion object {
-        /** ~430 ms of silence before a held reading fades. */
+        /** Frames of silence before a held reading fades: ~440 ms at 48 kHz, ~480 ms at 44.1 kHz. */
         const val STALE_FRAMES = 40
     }
 }

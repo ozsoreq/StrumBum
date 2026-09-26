@@ -22,7 +22,13 @@ AudioRecord 48 kHz float ──► strumbum-audio thread ──► Python Engine
 MainViewModel: string picker, in-tune detector ──► Compose tuner (spring needle, haptic tick on lock)
 ```
 
-The engine analyses a 2048-sample window every 512 samples, about 94 readings per second. A frame is dropped when its level is below −55 dBFS or its MPM clarity is below 0.9. When a new pluck follows silence, the smoother resets so the first reading comes quickly.
+Audio is captured at 48 kHz, or 44.1 kHz on devices that don't offer 48. The engine analyses a 2048-sample window every 512 samples: about 94 readings per second at 48 kHz, 86 at 44.1 kHz.
+
+- **Gates.** A frame is dropped when its level is below −55 dBFS or its clarity is below 0.85. Clarity is the MPM peak height, or 1 − aperiodicity when MPM finds no clear peak and YIN takes over. It tracks SNR / (1 + SNR), so the gate needs roughly 8 dB SNR.
+- **Band.** The detector covers 60 Hz to about 1.4 kHz. A note outside that band (a bass string, a very high harmonic) is rejected rather than shown as a wrong note or octave.
+- **Onset.** A new pluck after silence has to pass the gates for two frames in a row before it is shown, so a lone noise frame never lights up a note. The smoother then resets so the first reading comes quickly.
+- **Smoothing.** A 5-frame median, then an EMA whose step is scaled by each frame's SNR relative to the note's best frame. A note fading into room noise therefore keeps the value it had while it was clean.
+- **Stiffness.** String stiffness makes upper partials sharp, which pulls the autocorrelation sharp too (about +2 cents at inharmonicity 1e-4). From 180 Hz up, clean frames are re-measured from the fundamental's own spectral peak. Below 180 Hz the bias remains (about +0.6 cents at a typical 3e-5).
 
 ## Pitch engine
 
@@ -30,7 +36,7 @@ The engine analyses a 2048-sample window every 512 samples, about 94 readings pe
 cd engine
 pip install -e ".[dev]"
 pytest -q
-python -m devtools.benchmark                   # accuracy, first-reading latency, frame cost
+python -m devtools.benchmark                   # accuracy and first-reading latency (48 and 44.1 kHz), frame cost
 python -m devtools.benchmark --wav-dir DIR     # add real recordings, e.g. E2.wav, G3_+12c.wav
 python -m devtools.benchmark --pyin            # compare with librosa pYIN (pip install -e ".[reference]")
 python -m devtools.render_tones                # regenerate app/src/main/res/raw/tone_*.ogg
@@ -38,9 +44,9 @@ python -m devtools.render_tones                # regenerate app/src/main/res/raw
 
 Results on the synthetic set. The spec targets are ±1 cent and under 150 ms to the first stable reading.
 
-- Worst median error: 0.42 cents. Clean signals stay under 0.1.
-- First stable reading: 24–56 ms after the pluck.
-- Frame cost: about 0.24 ms on a desktop CPU. It still needs profiling on a real phone.
+- Worst median error: 0.47 cents (at 48 kHz and 44.1 kHz). Clean signals stay under 0.1.
+- First stable reading: 24–67 ms after the pluck.
+- Frame cost: 0.17–0.35 ms on a desktop CPU (notes from 180 Hz up take one more FFT). It still needs profiling on a real phone.
 
 **Still to do:** run the benchmark on real guitar recordings. The synthetic plucks include string stiffness and noise, but real recordings are the real test.
 
@@ -70,7 +76,7 @@ Requirements: JDK 17 and the Android SDK (compileSdk 36). Chaquopy's `buildPytho
 - Auto string detection with hysteresis. Tap a string to lock it.
 - Presets: Standard, Drop D, DADGAD, Open G/D/E, Half-step down, Full-step down, plus a Chromatic mode.
 - A4 calibration from 415 to 466 Hz.
-- In-tune lock: the needle turns green and you feel a haptic tick after the pitch holds within ±3 cents for 400 ms.
+- In-tune lock: the needle turns green and the label says "In tune" as soon as the pitch is within ±3 cents. After it holds there for 400 ms, the meter glows and you feel a haptic tick. The label and the lock release only once the pitch goes past ±5 cents, so a string sitting right at the edge doesn't flicker or buzz repeatedly.
 - Reference tones, synthesized in Python and played through SoundPool. Hold a string or tap Play. Calibration is applied through the playback rate, and the mic is muted while a tone plays.
 - Themes: dark-first, follows the system, with AMOLED black and high-contrast options.
 - Accessibility: arrows plus "Tune up/down" text so colour is never the only signal. Touch targets are at least 48 dp, and TalkBack gets labels and polite live regions.

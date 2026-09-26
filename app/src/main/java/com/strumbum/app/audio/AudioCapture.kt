@@ -12,6 +12,7 @@ import androidx.annotation.RequiresPermission
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.concurrent.atomic.AtomicBoolean
 
 sealed interface CaptureStatus {
     data object Idle : CaptureStatus
@@ -32,8 +33,14 @@ class AudioCapture(private val context: Context) {
     private val _status = MutableStateFlow<CaptureStatus>(CaptureStatus.Idle)
     val status: StateFlow<CaptureStatus> = _status.asStateFlow()
 
-    @Volatile private var running = false
+    /**
+     * Each start() gets its own flag. A worker whose session was stopped can still be busy
+     * opening the mic or starting Python (seconds, the first time); its flag keeps it from
+     * running on or publishing anything once it gets there, even if a new session started.
+     */
+    private var session: AtomicBoolean? = null
     private var worker: Thread? = null
+    private val publishLock = Any()
 
     /** While muted, frames are still analysed but not published (e.g. during a reference tone). */
     @Volatile var muted: Boolean = false
@@ -41,28 +48,44 @@ class AudioCapture(private val context: Context) {
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
     @Synchronized
     fun start() {
-        if (worker?.isAlive == true && running) return
-        worker?.join(STOP_TIMEOUT_MS)
-        running = true
+        if (worker?.isAlive == true && session?.get() == true) return
+        session?.set(false)
+        val active = AtomicBoolean(true)
+        session = active
+        // The previous worker may still hold the mic; the new one waits for it to let go.
+        val previous = worker
         _status.value = CaptureStatus.Starting
-        worker = Thread(::loop, "strumbum-audio").apply { start() }
+        worker = Thread({
+            previous?.join()
+            loop(active)
+        }, "strumbum-audio").apply { start() }
     }
 
     @Synchronized
     fun stop() {
-        running = false
+        synchronized(publishLock) {
+            session?.set(false)
+            _readings.value = PitchReading.NONE
+            if (_status.value !is CaptureStatus.Failed) _status.value = CaptureStatus.Idle
+        }
+        session = null
+        // Give the worker a moment to release the mic. It is not forgotten if it is still
+        // alive: the next start() waits for it.
         worker?.join(STOP_TIMEOUT_MS)
-        worker = null
-        _readings.value = PitchReading.NONE
-        if (_status.value !is CaptureStatus.Failed) _status.value = CaptureStatus.Idle
+    }
+
+    /** Runs [block] only while [active] is the current session, so a stale worker can't publish. */
+    private inline fun publish(active: AtomicBoolean, block: () -> Unit) {
+        synchronized(publishLock) { if (active.get()) block() }
     }
 
     @Suppress("MissingPermission") // start() is the only entry point and requires the permission.
-    private fun loop() {
+    private fun loop(active: AtomicBoolean) {
+        if (!active.get()) return
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
         val record = openRecord() ?: run {
-            _status.value = CaptureStatus.Failed("Could not open the microphone")
-            running = false
+            publish(active) { _status.value = CaptureStatus.Failed("Could not open the microphone") }
+            active.set(false)
             return
         }
         val engine = try {
@@ -70,28 +93,29 @@ class AudioCapture(private val context: Context) {
         } catch (t: Throwable) {
             Log.e(TAG, "pitch engine failed to start", t)
             record.release()
-            _status.value = CaptureStatus.Failed("Pitch engine failed to start")
-            running = false
+            publish(active) { _status.value = CaptureStatus.Failed("Pitch engine failed to start") }
+            active.set(false)
             return
         }
         try {
             record.startRecording()
-            _status.value = CaptureStatus.Running
+            publish(active) { _status.value = CaptureStatus.Running }
             val buf = FloatArray(PitchEngine.HOP)
-            while (running) {
+            while (active.get()) {
                 val n = record.read(buf, 0, buf.size, AudioRecord.READ_BLOCKING)
                 if (n < 0) {
-                    _status.value = CaptureStatus.Failed("Microphone error ($n)")
+                    publish(active) { _status.value = CaptureStatus.Failed("Microphone error ($n)") }
                     break
                 }
                 if (n == 0) continue
                 val reading = engine.feed(if (n == buf.size) buf else buf.copyOf(n))
-                if (!muted) _readings.value = reading
+                if (!muted) publish(active) { _readings.value = reading }
             }
         } catch (t: Throwable) {
             Log.e(TAG, "audio loop crashed", t)
-            _status.value = CaptureStatus.Failed("Audio stopped unexpectedly")
+            publish(active) { _status.value = CaptureStatus.Failed("Audio stopped unexpectedly") }
         } finally {
+            active.set(false)
             runCatching { record.stop() }
             record.release()
         }

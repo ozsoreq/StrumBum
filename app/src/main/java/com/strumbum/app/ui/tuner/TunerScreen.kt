@@ -48,6 +48,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.strumbum.app.audio.CaptureStatus
 import com.strumbum.app.music.NoteMath
+import com.strumbum.app.music.Tunings
 import com.strumbum.app.ui.TunerUiState
 import com.strumbum.app.ui.theme.LocalTunerColors
 import com.strumbum.app.ui.theme.accentFor
@@ -90,16 +91,21 @@ fun TunerScreen(
             StringRow(state, onToggleLock, onAuto, onPlayTone)
         }
         Spacer(Modifier.height(12.dp))
-        val toneMidi = state.lockedString?.let { state.tuning.strings[it] } ?: state.targetMidi
+        val toneMidi = state.lockedString?.let { state.tuning.strings.getOrNull(it) } ?: state.targetMidi
+        // Tones are rendered for 36..67 only; chromatic mode can target any note.
+        val hasTone = toneMidi != null && toneMidi in Tunings.toneRange
         FilledTonalButton(
             onClick = { toneMidi?.let(onPlayTone) },
-            enabled = toneMidi != null,
+            enabled = hasTone,
             modifier = Modifier.heightIn(min = 48.dp),
         ) {
             Icon(Icons.Filled.PlayArrow, contentDescription = null)
             Spacer(Modifier.size(8.dp))
             Text(
-                toneMidi?.let { "Play ${NoteMath.noteName(it, state.tuning.preferFlats)}" } ?: "Play reference tone",
+                toneMidi?.let {
+                    val name = NoteMath.noteName(it, state.tuning.preferFlats)
+                    if (hasTone) "Play $name" else "No tone for $name"
+                } ?: "Play reference tone",
             )
         }
     }
@@ -184,22 +190,27 @@ private fun Readout(state: TunerUiState) {
 @Composable
 private fun Direction(state: TunerUiState, accent: Color) {
     val cents = state.cents
+    // The in-tune band has hysteresis (enter within ±3 cents, leave past ±5), see InTuneDetector.
+    val inBand = state.inTune || state.centered
     val (icon, label) = when {
         state.status is CaptureStatus.Starting -> null to "Warming up…"
         cents == null -> null to "Pluck a string"
-        state.inTune || abs(cents) <= 3.0 -> Icons.Filled.Check to "In tune"
+        // A faded reading is only a memory; don't present it as advice unless it had locked.
+        state.stale && !state.inTune -> null to "Pluck again"
+        inBand -> Icons.Filled.Check to "In tune"
         cents < 0 -> Icons.Filled.KeyboardArrowUp to "Tune up"
         else -> Icons.Filled.KeyboardArrowDown to "Tune down"
     }
-    val detail = if (cents != null && !state.inTune && abs(cents) > 3.0) {
-        val n = abs(cents).roundToInt()
+    val n = state.roundedCents
+    val detail = if (cents != null && n != null && !inBand) {
         "$n ${if (n == 1) "cent" else "cents"} ${if (cents < 0) "flat" else "sharp"}"
     } else {
         null
     }
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        // Only the label is announced; it changes rarely (up / down / in tune), so TalkBack isn't flooded.
+        // Only the label is announced. Thanks to the band's hysteresis it changes only when the
+        // advice really changes (up / down / in tune), so TalkBack isn't flooded.
         modifier = Modifier.semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite },
     ) {
         if (icon != null) Icon(icon, contentDescription = null, tint = accent, modifier = Modifier.size(32.dp))

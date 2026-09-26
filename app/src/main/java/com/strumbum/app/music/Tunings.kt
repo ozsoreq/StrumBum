@@ -36,6 +36,9 @@ object Tunings {
 
     fun byId(id: String?): Tuning = all.firstOrNull { it.id == id } ?: STANDARD
 
-    /** Lowest and highest MIDI notes any preset asks for; the reference tones cover this range. */
+    /**
+     * MIDI notes that have a rendered reference tone: the presets' strings (38..64) plus a
+     * little room either side. Chromatic mode can target notes outside it, which have no tone.
+     */
     val toneRange: IntRange = 36..67
 }

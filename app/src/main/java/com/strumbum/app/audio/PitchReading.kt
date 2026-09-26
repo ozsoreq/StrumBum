@@ -9,7 +9,7 @@ data class PitchReading(
     val rawHz: Double,
     val clarity: Double,
     val rmsDb: Double,
-    /** Analysis frames (~10.7 ms each) since the last gated-in frame. */
+    /** Analysis frames since the last gated-in frame (10.7 ms each at 48 kHz, 11.6 ms at 44.1 kHz). */
     val silentFrames: Int,
 ) {
     companion object {
