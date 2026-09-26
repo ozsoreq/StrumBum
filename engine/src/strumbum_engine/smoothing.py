@@ -3,7 +3,8 @@
 Smoothing runs in the log-frequency (cents) domain, so the EMA behaves the same on
 low E as on high e. The median removes one-frame glitches such as octave errors.
 When the median moves by more than ``jump_cents``, a new note is playing. The EMA
-then snaps to it instead of gliding across the gap.
+then snaps to it instead of gliding across the gap. Each EMA step can be scaled by a
+per-frame confidence weight, so low-SNR frames barely move the reading.
 """
 
 from __future__ import annotations
@@ -40,7 +41,8 @@ class PitchSmoother:
     def value(self) -> float | None:
         return None if self._ema is None else cents_to_hz(self._ema)
 
-    def push(self, hz: float) -> float:
+    def push(self, hz: float, weight: float = 1.0) -> float:
+        """Add one frame. ``weight`` in [0, 1] scales the EMA step (frame confidence)."""
         c = hz_to_cents(hz)
         self._history.append(c)
         med = float(np.median(self._history))
@@ -51,5 +53,5 @@ class PitchSmoother:
             self._history.extend(keep)
             self._ema = med
         else:
-            self._ema += self.alpha * (med - self._ema)
+            self._ema += self.alpha * min(1.0, max(0.0, weight)) * (med - self._ema)
         return cents_to_hz(self._ema)

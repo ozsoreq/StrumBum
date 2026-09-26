@@ -90,3 +90,59 @@ def test_yin_fallback_when_mpm_finds_no_peak(det, monkeypatch):
     assert {e.method for e in ests} == {"yin"}
     hz = [e.frequency for e in ests if e.clarity >= 0.9]
     assert abs(cents_between(float(np.median(hz)), target)) < 1.0
+
+
+BAND = (SR / PitchDetector(SR, WINDOW).max_lag, SR / PitchDetector(SR, WINDOW).min_lag)
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_babble_never_reports_a_pitch_outside_the_band(det, seed):
+    # Regression: the YIN fallback's parabola used to extrapolate past max_lag and report
+    # e.g. 23 Hz at clarity 1.0 on babble.
+    for f in frames(babble(3.0, db=-30, seed=seed)):
+        e = det.estimate(f)
+        if e and e.method != "none":
+            assert BAND[0] <= e.frequency <= BAND[1]
+            assert 0.0 <= e.clarity <= 1.0
+
+
+@pytest.mark.parametrize("freq", [30.0, 41.2, 50.0, 58.0, 1420.0, 1500.0, 1760.0, 2093.0])
+def test_notes_outside_the_band_are_rejected(det, freq):
+    # Below 60 Hz or above ~1411 Hz there is no right answer inside the band, so no
+    # confident reading at all (not a wrong note or an octave).
+    x = pluck(freq, seconds=1.0)
+    assert not [e for e in (det.estimate(f) for f in frames(x)) if e and e.clarity >= 0.5]
+
+
+@pytest.mark.parametrize("freq", [61.0, 1400.0])
+def test_band_edges_still_read(det, freq):
+    hz = [e.frequency for e in (det.estimate(f) for f in frames(pluck(freq, seconds=0.8), skip_s=0.05)) if e.clarity >= 0.9]
+    assert len(hz) > 50
+    assert abs(cents_between(float(np.median(hz)), freq)) < 1.0
+
+
+def test_yin_without_a_dip_is_unvoiced(det, monkeypatch):
+    monkeypatch.setattr(det, "_mpm", lambda nsdf: None)
+    ests = [det.estimate(f) for f in frames(white_noise(0.5, db=-30))]
+    assert ests and all(e.method == "none" and e.clarity == 0.0 and e.frequency == 0.0 for e in ests)
+
+
+@pytest.mark.parametrize("note", ["G3", "B3", "E4", "A4"])
+@pytest.mark.parametrize("stiffness", [1e-4, 3e-4])
+def test_stiff_strings_read_the_fundamental(det, note, stiffness):
+    # Stiffness puts partial k at k*f0*sqrt(1 + B k^2); the autocorrelation alone reads
+    # +1.9 c (B = 1e-4) and +5.3 c (B = 3e-4) sharp. The fundamental itself is only
+    # sqrt(1 + B) sharp.
+    target = midi_to_hz(parse_note(note))
+    x = pluck(target, seconds=1.0, inharmonicity=stiffness, decay=30.0, seed=7)
+    hz = [e.frequency for e in (det.estimate(f) for f in frames(x, skip_s=0.05)) if e.clarity >= 0.9]
+    expected = cents_between(target * np.sqrt(1 + stiffness), target)
+    assert abs(cents_between(float(np.median(hz)), target) - expected) < 0.3
+
+
+def test_parabolic_stays_between_its_neighbours():
+    from strumbum_engine.detector import _parabolic
+
+    # A monotone slope has no vertex nearby; the shift must not run off to it.
+    x, _ = _parabolic(np.array([3.0, 2.0, 1.5]), 1)
+    assert 0.5 <= x <= 1.5

@@ -3,7 +3,8 @@ import array
 import numpy as np
 import pytest
 
-from devtools.synth import SR, babble, pluck
+from devtools.synth import SR, babble, pluck, white_noise
+from strumbum_engine.detector import PitchEstimate
 from strumbum_engine.engine import CLARITY, HAS_PITCH, RAW_HZ, SILENT_FRAMES, SMOOTHED_HZ, Engine
 from strumbum_engine.notes import cents_between, midi_to_hz, parse_note
 
@@ -98,3 +99,92 @@ def test_reset_clears_state():
     e.reset()
     r = e.feed(np.zeros(512, np.float32))
     assert r[HAS_PITCH] == 0.0
+    # Even a chunk too short to complete a hop must not return the pre-reset reading.
+    e.feed(pluck(110.0, seconds=0.3))
+    e.reset()
+    assert e.feed(np.zeros(100, np.float32))[:2] == (0.0, 0.0)
+
+
+@pytest.mark.parametrize("kw", [dict(hop=0), dict(hop=-1), dict(window=2048, hop=4096)])
+def test_rejects_bad_hop(kw):
+    with pytest.raises(ValueError):
+        Engine(**kw)
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+def test_non_finite_samples_do_not_poison_the_output(bad):
+    x = with_silence(pluck(110.0, seconds=1.5))
+    x[int(0.8 * SR)] = bad
+    res = [r for _, r in run(Engine(), x)]
+    assert all(np.isfinite(v) for r in res for v in r[:5])
+    tail = [r[SMOOTHED_HZ] for r in res[-20:] if r[HAS_PITCH]]
+    assert tail and all(abs(cents_between(h, 110.0)) < 1 for h in tail)
+
+
+def test_non_finite_estimates_fail_the_gates(monkeypatch):
+    e = Engine()
+    monkeypatch.setattr(e.detector, "estimate", lambda frame: PitchEstimate(float("nan"), float("nan"), float("nan"), "mpm"))
+    assert all(r[HAS_PITCH] == 0.0 for _, r in run(e, pluck(110.0, seconds=0.3)))
+
+
+@pytest.mark.parametrize(
+    "convert",
+    [
+        lambda a: a.astype(np.float64),
+        lambda a: array.array("d", a.astype(np.float64)),
+        lambda a: a.astype(np.float64).tolist(),
+    ],
+    ids=["float64 ndarray", "array('d')", "list"],
+)
+def test_non_float32_input_is_converted_not_reinterpreted(convert):
+    x = with_silence(pluck(110.0, seconds=0.8))
+    e = Engine()
+    r = None
+    for i in range(0, len(x) - 511, 512):
+        r = e.feed(convert(x[i : i + 512]))
+    assert r[HAS_PITCH] == 1.0
+    assert abs(cents_between(r[SMOOTHED_HZ], 110.0)) < 1
+
+
+def _fake_frames(e, monkeypatch, voiced):
+    """Drive the engine with scripted detector results: True = a clean 110 Hz frame."""
+    script = iter(voiced)
+    monkeypatch.setattr(
+        e.detector,
+        "estimate",
+        lambda frame: PitchEstimate(110.0, 0.99, -20.0, "mpm") if next(script) else PitchEstimate(0.0, 0.0, -20.0, "none"),
+    )
+    return [e.feed(np.zeros(e.hop, np.float32)) for _ in voiced]
+
+
+def test_a_lone_frame_after_silence_is_not_published(monkeypatch):
+    res = _fake_frames(Engine(), monkeypatch, [False] * 20 + [True] + [False] * 20)
+    assert not any(r[HAS_PITCH] for r in res)
+    assert res[-1][SMOOTHED_HZ] == 0.0
+
+
+def test_a_pluck_is_published_once_confirmed(monkeypatch):
+    res = _fake_frames(Engine(confirm_frames=2), monkeypatch, [False] * 20 + [True] * 3)
+    assert [r[HAS_PITCH] for r in res[-3:]] == [0.0, 1.0, 1.0]
+    # Short gaps inside a note don't need confirming again.
+    res = _fake_frames(Engine(), monkeypatch, [False] * 20 + [True] * 5 + [False] * 3 + [True])
+    assert res[-1][HAS_PITCH] == 1.0
+
+
+@pytest.mark.parametrize("note", ["E2", "A2", "G3", "E4"])
+@pytest.mark.parametrize("detune", [5.0, -8.0])
+def test_held_value_after_fading_into_noise(note, detune):
+    # Regression: a note that fades into room noise used to be held at its noisiest last
+    # frames, up to 8 c away from where it had settled ("In tune" for a +5 c string).
+    # The held value must stay where the healthy part of the note settled.
+    target = midi_to_hz(parse_note(note)) * 2 ** (detune / 1200)
+    drift = []
+    for seed in range(4):
+        x = with_silence(pluck(target, seconds=6.0, decay=1.5, seed=seed))
+        x = x + white_noise(len(x) / SR, db=-45, seed=100 + seed)
+        res = run(Engine(), x)
+        assert not res[-1][1][HAS_PITCH], "the note should have faded below the gate"
+        settled = np.median([r[SMOOTHED_HZ] for t, r in res if 0.6 < t < 1.3 and r[HAS_PITCH]])
+        drift.append(abs(cents_between(res[-1][1][SMOOTHED_HZ], settled)))
+    assert np.median(drift) < 1.0
+    assert max(drift) < 2.0

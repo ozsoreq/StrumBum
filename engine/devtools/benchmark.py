@@ -30,9 +30,8 @@ SYNTH_NOTES = "D2 E2 A2 D3 G3 B3 E4 C3 F3 A3 D4".split()
 _NAME = re.compile(r"^([A-Ga-g][#b]?-?\d)(?:_([+-]?\d+(?:\.\d+)?)c)?")
 
 
-def evaluate(x: np.ndarray, target: float, sr: int = SR) -> dict:
+def evaluate(x: np.ndarray, target: float, sr: int = SR, chunk: int = 256) -> dict:
     eng = Engine(sample_rate=sr)
-    chunk = 256
     onset = _onset(x, sr)
     first = None
     settled = []
@@ -60,13 +59,16 @@ def _onset(x: np.ndarray, sr: int) -> float:
 
 
 def synthetic_cases():
+    # 48 kHz in 256-sample chunks, plus the app's 44.1 kHz fallback in its 512-sample chunks.
     rng = np.random.default_rng(42)
-    for note in SYNTH_NOTES:
-        for noise in (None, -45.0):
-            detune = float(rng.uniform(-30, 30))
-            f = midi_to_hz(parse_note(note)) * 2 ** (detune / 1200)
-            x = np.concatenate([np.zeros(SR // 5, np.float32), pluck(f, 1.5, noise_db=noise, seed=int(f))])
-            yield f"{note} {detune:+.1f}c{' noisy' if noise else ''}", x, f, SR
+    for sr, chunk in ((SR, 256), (44_100, 512)):
+        tag = "" if sr == SR else f" {sr / 1000:g}k/{chunk}"
+        for note in SYNTH_NOTES:
+            for noise in (None, -45.0):
+                detune = float(rng.uniform(-30, 30))
+                f = midi_to_hz(parse_note(note)) * 2 ** (detune / 1200)
+                x = np.concatenate([np.zeros(sr // 5, np.float32), pluck(f, 1.5, sr=sr, noise_db=noise, seed=int(f))])
+                yield f"{note} {detune:+.1f}c{' noisy' if noise else ''}{tag}", x, f, sr, chunk
 
 
 def wav_cases(folder: pathlib.Path):
@@ -78,12 +80,12 @@ def wav_cases(folder: pathlib.Path):
             continue
         x, sr = sf.read(p, dtype="float32", always_2d=True)
         f = midi_to_hz(parse_note(m.group(1))) * 2 ** (float(m.group(2) or 0) / 1200)
-        yield p.name, x.mean(axis=1), f, sr
+        yield p.name, x.mean(axis=1), f, sr, 256
 
 
-def frame_speed(n: int = 2000) -> float:
+def frame_speed(freq: float, n: int = 2000) -> float:
     det = PitchDetector()
-    x = pluck(110.0, 1.0)
+    x = pluck(freq, 1.0)
     frames = [x[i : i + 2048] for i in range(0, len(x) - 2048, 512)]
     t0 = time.perf_counter()
     for k in range(n):
@@ -109,13 +111,13 @@ def main() -> int:
     if args.wav_dir:
         cases += list(wav_cases(args.wav_dir))
 
-    header = f"{'case':<26}{'first ms':>9}{'med err c':>11}{'p95 |err| c':>13}"
+    header = f"{'case':<34}{'first ms':>9}{'med err c':>11}{'p95 |err| c':>13}"
     print(header + ("   pYIN med c" if args.pyin else ""))
     worst_first, worst_err, failures = 0.0, 0.0, 0
-    for name, x, f, sr in cases:
-        r = evaluate(x, f, sr)
+    for name, x, f, sr, chunk in cases:
+        r = evaluate(x, f, sr, chunk)
         first = r["first_ms"]
-        line = f"{name:<26}{'—' if first is None else f'{first:.0f}':>9}{r['median_err']:>11.2f}{r['p95_abs_err']:>13.2f}"
+        line = f"{name:<34}{'—' if first is None else f'{first:.0f}':>9}{r['median_err']:>11.2f}{r['p95_abs_err']:>13.2f}"
         if args.pyin:
             line += f"{pyin_median(x, sr, f):>14.2f}"
         ok = first is not None and first < 150 and abs(r["median_err"]) < 1.0
@@ -125,7 +127,9 @@ def main() -> int:
         print(line + ("" if ok else "   FAIL"))
     print(f"\nworst first reading: {worst_first:.0f} ms (target < 150)")
     print(f"worst median error:  {worst_err:.2f} cents (target < 1)")
-    print(f"frame cost:          {frame_speed():.3f} ms on this machine (target ~1 ms on a mid-range phone)")
+    # Notes from 180 Hz up also take the stiffness correction (one more FFT), so time both.
+    cost = max(frame_speed(110.0), frame_speed(330.0))
+    print(f"frame cost:          {cost:.3f} ms on this machine (target ~1 ms on a mid-range phone)")
     return 1 if failures else 0
 
 

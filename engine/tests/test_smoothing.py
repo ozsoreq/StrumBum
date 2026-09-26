@@ -38,3 +38,14 @@ def test_small_moves_are_eased():
 def test_rejects_bad_params():
     with pytest.raises(ValueError):
         PitchSmoother(alpha=0)
+
+
+def test_zero_weight_frames_do_not_move_the_reading():
+    s = PitchSmoother()
+    for _ in range(10):
+        s.push(110.0)
+    for _ in range(10):
+        s.push(110.0 * 2 ** (20 / 1200), weight=0.0)  # 20 c off, no confidence
+    assert s.value == pytest.approx(110.0)
+    s.push(110.0 * 2 ** (20 / 1200), weight=1.0)
+    assert s.value > 110.0
