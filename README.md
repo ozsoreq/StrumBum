@@ -81,6 +81,8 @@ Requirements: JDK 17 and the Android SDK (compileSdk 36). Chaquopy's `buildPytho
 - Themes: dark-first, follows the system, with AMOLED black and high-contrast options.
 - Accessibility: arrows plus "Tune up/down" text so colour is never the only signal. Touch targets are at least 48 dp, and TalkBack gets labels and polite live regions.
 - Onboarding with two cards: why the app needs the mic, then a live "pluck a string" demo.
+- Intro video on every launch (`res/raw/intro.mp4`, 15 s, 2.8 MB). Tap anywhere to skip. It is fitted rather than cropped on portrait screens, and it doesn't interrupt music that is already playing. The Python engine keeps loading underneath it.
+- App icon: the green pick with a tuner gauge over six strings, taken from the intro. It's an adaptive icon: the pick is a bitmap layer (`mipmap-*/ic_launcher_foreground.png`) over a vector tile with the strings, and it has a monochrome layer for themed icons. `store/icon-512.png` is the 512 px Play Store icon.
 - Ads: Google's UMP consent is asked after onboarding. Adaptive banners appear only on the Tunings and Settings pages, never on the tuner or during onboarding. An "Ad privacy choices" entry appears where UMP requires one.
 
 ### Not in this build
